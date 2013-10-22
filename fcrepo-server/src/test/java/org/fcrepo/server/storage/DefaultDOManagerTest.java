@@ -39,6 +39,7 @@ import org.fcrepo.server.management.BasicPIDGenerator;
 import org.fcrepo.server.management.ManagementModule;
 import org.fcrepo.server.resourceIndex.ResourceIndexModule;
 import org.fcrepo.server.search.FieldSearch;
+import org.fcrepo.server.storage.defaultStorage.ModelDeploymentMap;
 import org.fcrepo.server.storage.lowlevel.DefaultLowlevelStorageModule;
 import org.fcrepo.server.storage.translation.DOTranslatorModule;
 import org.fcrepo.server.storage.types.XMLDatastreamProcessor;
@@ -205,7 +206,7 @@ public class DefaultDOManagerTest
         ResultSet mockResult = mock(ResultSet.class);
         when(mockStmt.executeQuery()).thenReturn(mockResult);
         when(mockROConnection.prepareStatement(
-                eq(DefaultDOManager.CMODEL_QUERY),
+                eq(ModelDeploymentMap.CMODEL_QUERY),
                 eq(ResultSet.TYPE_FORWARD_ONLY),
                 eq(ResultSet.CONCUR_READ_ONLY)))
                 .thenReturn(mockStmt);

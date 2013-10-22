@@ -26,9 +26,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 
@@ -45,18 +43,22 @@ import org.fcrepo.server.errors.LowlevelStorageException;
 import org.fcrepo.server.errors.ModuleInitializationException;
 import org.fcrepo.server.errors.ObjectAlreadyInLowlevelStorageException;
 import org.fcrepo.server.errors.ObjectExistsException;
+import org.fcrepo.server.errors.ObjectIntegrityException;
 import org.fcrepo.server.errors.ObjectLockedException;
 import org.fcrepo.server.errors.ObjectNotFoundException;
 import org.fcrepo.server.errors.ObjectNotInLowlevelStorageException;
 import org.fcrepo.server.errors.ServerException;
 import org.fcrepo.server.errors.StorageDeviceException;
 import org.fcrepo.server.errors.StreamIOException;
+import org.fcrepo.server.errors.UnsupportedTranslationException;
 import org.fcrepo.server.management.Management;
 import org.fcrepo.server.management.PIDGenerator;
 import org.fcrepo.server.resourceIndex.ResourceIndex;
 import org.fcrepo.server.search.FieldSearch;
 import org.fcrepo.server.search.FieldSearchQuery;
 import org.fcrepo.server.search.FieldSearchResult;
+import org.fcrepo.server.storage.defaultStorage.ModelDeploymentMap;
+import org.fcrepo.server.storage.defaultStorage.ServiceContext;
 import org.fcrepo.server.storage.lowlevel.ILowlevelStorage;
 import org.fcrepo.server.storage.translation.DOTranslationUtility;
 import org.fcrepo.server.storage.translation.DOTranslator;
@@ -94,22 +96,22 @@ public class DefaultDOManager extends Module implements DOManager {
     
     private static final Pattern URL_PROTOCOL = Pattern.compile("^\\w+:\\/.*$");
     
-    public static String CMODEL_QUERY =
-        "SELECT cModel, sDef, sDep, mDate " +
-        " FROM modelDeploymentMap, doFields " +
-        " WHERE doFields.pid = modelDeploymentMap.sDep";
-
-
-    public static String REGISTERED_PID_QUERY =
+    private static final String FIELD_SEARCH_INDEX_ERROR =
+            "Error updating FieldSearch index for ";
+    
+    public static final String REGISTERED_PID_QUERY =
             "SELECT doPID FROM doRegistry WHERE doPID=?";
     
     public static String INSERT_PID_QUERY =
             "INSERT INTO doRegistry (doPID, ownerId, label) VALUES (?, ?, ?)";
+    
+    public static final String OBJECT_PIDS_QUERY =
+            "SELECT doPID FROM doRegistry WHERE systemVersion > 0";
 
-    public static String PID_VERSION_QUERY =
+    public static final String PID_VERSION_QUERY =
             "SELECT systemVersion FROM doRegistry WHERE doPID=?";
 
-    public static String PID_VERSION_UPDATE =
+    public static final String PID_VERSION_UPDATE =
             "UPDATE doRegistry SET systemVersion=? WHERE doPID=?";
 
     private String m_pidNamespace;
@@ -444,44 +446,17 @@ public class DefaultDOManager extends Module implements DOManager {
         // Deployments.
         m_cModelDeploymentMap = new ModelDeploymentMap();
 
-        logger.debug("Initializing content model deployment map");
-
         Connection c = null;
-        PreparedStatement s = null;
-        ResultSet r = null;
         try {
             c = m_connectionPool.getReadOnlyConnection();
-            s = c.prepareStatement(CMODEL_QUERY, ResultSet.TYPE_FORWARD_ONLY,
-                            ResultSet.CONCUR_READ_ONLY);
-            ResultSet results = s.executeQuery();
-
-            while (results.next()) {
-                String cModel = results.getString(1);
-                String sDef = results.getString(2);
-                String sDep = results.getString(3);
-                long lastMod = results.getLong(4);
-
-                m_cModelDeploymentMap.putDeployment(ServiceContext.getInstance(
-                        cModel, sDef), sDep, lastMod);
-            }
+            m_cModelDeploymentMap.initialize(c);
 
         } catch (SQLException e) {
-            throw new RuntimeException("Error loading cModel deployment cach",
+            throw new RuntimeException("Error loading cModel deployment cache",
                     e);
         } finally {
-            try {
-                if (r != null) {
-                    r.close();
-                }
-                if (s != null) {
-                    s.close();
-                }
-                if (c != null) {
-                    m_connectionPool.free(c);
-                }
-            } catch (SQLException e) {
-                throw new RuntimeException(
-                        "Error loading cModel deployment cach", e);
+            if (c != null) {
+                m_connectionPool.free(c);
             }
         }
 
@@ -494,10 +469,11 @@ public class DefaultDOManager extends Module implements DOManager {
      * @param obj
      *        DOReader of a service deployment object
      */
-    private synchronized void updateDeploymentMap(DigitalObject obj,
+    private void updateDeploymentMap(DigitalObject obj,
             Connection c, boolean isPurge) throws SQLException {
 
         String sDep = obj.getPid();
+        getWriteLock(sDep);
         Set<RelationshipTuple> sDefs =
                 obj.getRelationships(Constants.MODEL.IS_DEPLOYMENT_OF, null);
         Set<RelationshipTuple> models =
@@ -516,77 +492,8 @@ public class DefaultDOManager extends Module implements DOManager {
             }
         }
 
-        /* Read in the old deployment map from the cache */
-        Set<ServiceContext> oldContext =
-                m_cModelDeploymentMap.getContextFor(sDep);
-
-        /* Remove any obsolete deployments from the registry/cache */
-        for (ServiceContext o : oldContext) {
-            if (!newContext.contains(o)) {
-                removeDeployment(o, obj, c);
-            }
-        }
-
-        /* Add any new deployments from the registry/cache */
-        for (ServiceContext n : newContext) {
-            if (!oldContext.contains(n)) {
-                addDeployment(n, obj, c);
-            } else {
-                updateDeployment(n, obj, c);
-            }
-        }
-    }
-
-    private void addDeployment(ServiceContext context, DigitalObject sDep,
-            Connection c) throws SQLException {
-
-        String query =
-                "INSERT INTO modelDeploymentMap (cModel, sDef, sDep) VALUES (?, ?, ?)";
-        PreparedStatement s = c.prepareStatement(query);
-
-        try {
-            s.setString(1, context.cModel);
-            s.setString(2, context.sDef);
-            s.setString(3, sDep.getPid());
-            s.executeUpdate();
-        } finally {
-            if (s != null) {
-                s.close();
-            }
-        }
-
-        m_cModelDeploymentMap.putDeployment(context, sDep.getPid(), sDep
-                .getLastModDate().getTime());
-
-    }
-
-    private void updateDeployment(ServiceContext context, DigitalObject sDep,
-            Connection c) throws SQLException {
-
-        m_cModelDeploymentMap.putDeployment(context, sDep.getPid(), sDep
-                .getLastModDate().getTime());
-
-    }
-
-    private void removeDeployment(ServiceContext context, DigitalObject sDep,
-            Connection c) throws SQLException {
-        String query =
-                "DELETE FROM modelDeploymentMap "
-                        + "WHERE cModel = ? AND sDef =? AND sDep = ?";
-        PreparedStatement s = c.prepareStatement(query);
-        s.setString(1, context.cModel);
-        s.setString(2, context.sDef);
-        s.setString(3, sDep.getPid());
-
-        try {
-            s.executeUpdate();
-        } finally {
-            if (s != null) {
-                s.close();
-            }
-        }
-        m_cModelDeploymentMap.removeDeployment(context, sDep.getPid());
-
+        m_cModelDeploymentMap.replaceContexts(obj, newContext, c);
+        releaseWriteLock(sDep);
     }
 
     @Override
@@ -853,36 +760,7 @@ public class DefaultDOManager extends Module implements DOManager {
                         format, encoding,
                         DOTranslationUtility.DESERIALIZE_INSTANCE);
 
-                // SET OBJECT PROPERTIES:
-                logger.debug("Setting object/component states and create dates if unset");
-                // set object state to "A" (Active) if not already set
-                if (obj.getState() == null || obj.getState().isEmpty()) {
-                    obj.setState("A");
-                }
-                // set object create date to UTC if not already set
-                if (obj.getCreateDate() == null) {
-                    obj.setCreateDate(nowUTC);
-                }
-                // set object last modified date to UTC
-                obj.setLastModDate(nowUTC);
-
-                // SET DATASTREAM PROPERTIES...
-                Iterator<String> dsIter = obj.datastreamIdIterator();
-                while (dsIter.hasNext()) {
-                    for (Datastream ds : obj.datastreams(dsIter.next())) {
-                        // Set create date to UTC if not already set
-                        if (ds.DSCreateDT == null) {
-                            ds.DSCreateDT = nowUTC;
-                        }
-                        // Set state to "A" (Active) if not already set
-                        if (ds.DSState == null || ds.DSState.isEmpty()) {
-                            ds.DSState = "A";
-                        }
-                        ds.DSChecksumType =
-                                Datastream
-                                        .validateChecksumType(ds.DSChecksumType);
-                    }
-                }
+                DigitalObjectUtil.setIngestDefaults(obj, nowUTC);
 
                 // SET MIMETYPE AND FORMAT_URIS FOR LEGACY OBJECTS' DATASTREAMS
                 if (FOXML1_0.uri.equals(format) ||
@@ -1076,7 +954,139 @@ public class DefaultDOManager extends Module implements DOManager {
         out.close();
         dcxml.setXMLContent(bytes.toByteArray());
     }
+    
+    private static MIMETypedStream getUploadedContent(
+            Management management, String pid,
+            Datastream dmc) throws ServerException {
+        MIMETypedStream mimeTypedStream =
+                new MIMETypedStream(
+                        null,
+                        management
+                                .getTempStream(dmc.DSLocation),
+                        null, dmc.DSSize);
+        logger.info(
+                "Getting managed datastream from internal uploaded " +
+                "location: {} for {}/{}",
+                dmc.DSLocation, pid, dmc.DatastreamID);
+        return mimeTypedStream;
+    }
+    
+    private static MIMETypedStream getCopiedContent(
+            ILowlevelStorage permanentStore, String pid,
+            Datastream dmc) throws ServerException {
+        MIMETypedStream mimeTypedStream =
+                new MIMETypedStream(
+                        null,
+                        permanentStore
+                                .retrieveDatastream(dmc.DSLocation
+                                        .substring(7)),
+                        null, dmc.DSSize);
+        return mimeTypedStream;
+    }
 
+    private static MIMETypedStream getTempContent(
+            String pid, Datastream dmc) throws ServerException {
+        MIMETypedStream mimeTypedStream;
+        String dsID = dmc.DatastreamID;
+        File file =
+                new File(dmc.DSLocation
+                        .substring(DatastreamManagedContent.TEMP_SCHEME.length()));
+        logger.info("Getting base64 decoded datastream spooled from archive for datastream {} ({})",
+                dsID, pid);
+        try {
+            InputStream str =
+                    new FileInputStream(file);
+            mimeTypedStream =
+                    new MIMETypedStream(dmc.DSMIME,
+                            str, null, file
+                                    .length());
+        } catch (FileNotFoundException fnfe) {
+            logger.error(
+                    "Unable to read temp file created for datastream from archive for " +
+                            pid + " / " + dsID,
+                    fnfe);
+            throw new StreamIOException(
+                    "Error reading from temporary file created for binary content for " +
+                            pid + " / " + dsID);
+        }
+        return mimeTypedStream;
+    }
+    
+    private static MIMETypedStream getExternalContent(
+            String pid,
+            ExternalContentManager contentManager,
+            Datastream dmc,
+            Context context) throws ServerException {
+        MIMETypedStream mimeTypedStream;
+        String dsID = dmc.DatastreamID;
+        ContentManagerParams params =
+                new ContentManagerParams(
+                        DOTranslationUtility
+                                .makeAbsoluteURLs(dmc.DSLocation),
+                        dmc.DSMIME, null, null);
+        params.setContext(context);
+        mimeTypedStream =
+                contentManager
+                        .getExternalContent(params);
+        logger.info("Getting managed datastream from remote location: {} ({} / {})",
+                dmc.DSLocation, pid, dsID);
+        return mimeTypedStream;
+    }
+    
+    private void updateDORegistry(DigitalObject obj)
+             throws ObjectNotFoundException, StorageDeviceException {
+        String pid = obj.getPid();
+        logger.debug("Updating registry for {}", pid);
+        Connection conn = null;
+        PreparedStatement s = null;
+        ResultSet results = null;
+        try {
+            conn = m_connectionPool.getReadWriteConnection();
+            s = conn.prepareStatement(PID_VERSION_QUERY);
+            s.setString(1, obj.getPid());
+            results = s.executeQuery();
+            if (!results.next()) {
+                throw new ObjectNotFoundException(
+                        "Error creating replication job: The requested object " +
+                                pid + " doesn't exist in the registry.");
+            }
+            int systemVersion = results.getInt("systemVersion");
+            systemVersion++;
+            s = conn.prepareStatement(PID_VERSION_UPDATE);
+            s.setInt(1, systemVersion);
+            s.setString(2, obj.getPid());
+            s.executeUpdate();
+
+            //TODO hasModel
+            if (obj.hasContentModel(Models.SERVICE_DEPLOYMENT_3_0)) {
+                updateDeploymentMap(obj, conn, false);
+            }
+        } catch (SQLException sqle) {
+            throw new StorageDeviceException(
+                    "Error creating replication job for " + pid + ": " +
+                            sqle.getMessage(), sqle);
+        } finally {
+            try {
+                if (results != null) {
+                    results.close();
+                }
+                if (s != null) {
+                    s.close();
+                }
+                if (conn != null) {
+                    m_connectionPool.free(conn);
+                }
+            } catch (SQLException sqle) {
+                throw new StorageDeviceException(
+                        "Unexpected error from SQL database for " +
+                                pid + ": " + sqle.getMessage(), sqle);
+            } finally {
+                results = null;
+                s = null;
+            }
+        }
+    }
+    
     /**
      * The doCommit method finalizes an ingest/update/remove of a digital
      * object. The process makes updates the object modified date, stores
@@ -1113,164 +1123,20 @@ public class DefaultDOManager extends Module implements DOManager {
 
                 // DATASTREAM STORAGE:
                 // copy and store any datastreams of type Managed Content
-                Iterator<String> dsIDIter = obj.datastreamIdIterator();
-                while (dsIDIter.hasNext()) {
-                    String dsID = dsIDIter.next();
-                    Datastream dStream =
-                            obj.datastreams(dsID).iterator().next();
-                    String controlGroupType = dStream.DSControlGrp;
-                    // if it's managed, we might need to grab content
-                    if (controlGroupType.equalsIgnoreCase("M")) {
-                        // iterate over all versions of this dsID
-                        for (Datastream dmc : obj.datastreams(dsID)) {
-                            String internalId =
-                                    pid + "+" + dmc.DatastreamID + "+" +
-                                            dmc.DSVersionID;
-                            // if it's a url, we need to grab content for this
-                            // version
-                            if (URL_PROTOCOL.matcher(dmc.DSLocation).matches()) {
-                                MIMETypedStream mimeTypedStream;
-                                if (dmc.DSLocation
-                                        .startsWith(DatastreamManagedContent.UPLOADED_SCHEME)) {
-                                    mimeTypedStream =
-                                            new MIMETypedStream(
-                                                    null,
-                                                    m_management
-                                                            .getTempStream(dmc.DSLocation),
-                                                    null, dmc.DSSize);
-                                    logger.info("Getting managed datastream from internal uploaded " +
-                                            "location: {} for ",
-                                            dmc.DSLocation, pid);
-                                } else if (dmc.DSLocation
-                                        .startsWith(DatastreamManagedContent.COPY_SCHEME)) {
-                                    // make a copy of the pre-existing content
-                                    mimeTypedStream =
-                                            new MIMETypedStream(
-                                                    null,
-                                                    m_permanentStore
-                                                            .retrieveDatastream(dmc.DSLocation
-                                                                    .substring(7)),
-                                                    null, dmc.DSSize);
-                                } else if (dmc.DSLocation
-                                        .startsWith(DatastreamManagedContent.TEMP_SCHEME)) {
-                                    File file =
-                                            new File(dmc.DSLocation
-                                                    .substring(7));
-                                    logger.info("Getting base64 decoded datastream spooled from archive for datastream {} ({})",
-                                            dsID, pid);
-                                    try {
-                                        InputStream str =
-                                                new FileInputStream(file);
-                                        mimeTypedStream =
-                                                new MIMETypedStream(dmc.DSMIME,
-                                                        str, null, file
-                                                                .length());
-                                    } catch (FileNotFoundException fnfe) {
-                                        logger.error(
-                                                "Unable to read temp file created for datastream from archive for " +
-                                                        pid + " / " + dsID,
-                                                fnfe);
-                                        throw new StreamIOException(
-                                                "Error reading from temporary file created for binary content for " +
-                                                        pid + " / " + dsID);
-                                    }
-                                } else {
-                                    ContentManagerParams params =
-                                            new ContentManagerParams(
-                                                    DOTranslationUtility
-                                                            .makeAbsoluteURLs(dmc.DSLocation
-                                                                    .toString()),
-                                                    dmc.DSMIME, null, null);
-                                    params.setContext(context);
-                                    mimeTypedStream =
-                                            m_contentManager
-                                                    .getExternalContent(params);
-                                    logger.info("Getting managed datastream from remote location: {} ({} / {})",
-                                            dmc.DSLocation, pid, dsID);
-                                }
-                                Map<String, String> dsHints =
-                                        m_hintProvider
-                                                .getHintsForAboutToBeStoredDatastream(
-                                                        obj, dmc.DatastreamID);
-                                if (obj.isNew()) {
-                                    dmc.DSSize =
-                                            m_permanentStore.addDatastream(
-                                                    internalId, mimeTypedStream
-                                                            .getStream(),
-                                                    dsHints);
-                                } else {
-                                    // object already existed...so we may need
-                                    // to call
-                                    // replace if "add" indicates that it was
-                                    // already there
-                                    try {
-                                        dmc.DSSize =
-                                                m_permanentStore.addDatastream(
-                                                        internalId,
-                                                        mimeTypedStream
-                                                                .getStream(),
-                                                        dsHints);
-                                    } catch (ObjectAlreadyInLowlevelStorageException oailse) {
-                                        dmc.DSSize =
-                                                m_permanentStore
-                                                        .replaceDatastream(
-                                                                internalId,
-                                                                mimeTypedStream
-                                                                        .getStream(),
-                                                                dsHints);
-                                    }
-                                }
-                                if (mimeTypedStream != null) {
-                                    mimeTypedStream.close();
-                                    if (dmc.DSLocation
-                                            .startsWith(DatastreamManagedContent.TEMP_SCHEME)) {
-                                        // delete the temp file created to store
-                                        // the binary content from archive
-                                        File file =
-                                                new File(dmc.DSLocation
-                                                        .substring(7));
-                                        if (file.exists()) {
-                                            if (!file.delete()) {
-                                                logger.warn("Failed to remove temp file, marked for deletion when VM closes: " +
-                                                        file.toString());
-                                                file.deleteOnExit();
-                                            }
-                                        } else {
-                                            logger.warn("Cannot delete temp file as it no longer exists: " +
-                                                    file.getAbsolutePath());
-                                        }
-                                    }
-                                    // Reset dsLocation in object to new
-                                    // internal location.
-                                    dmc.DSLocation = internalId;
-                                    dmc.DSLocationType =
-                                            Datastream.DS_LOCATION_TYPE_INTERNAL;
-                                    logger.info("Replaced managed datastream location with internal id: {}",
-                                            internalId);
-                                }
-                            } else if (!internalId.equals(dmc.DSLocation)) {
-                                logger.error("Unrecognized DSLocation \"" +
-                                        dmc.DSLocation +
-                                        "\" given for datastream " +
-                                        dmc.DatastreamID + " of object " + pid);
-                            }
-                        }
-                    }
-                }
-
-                // MANAGED DATASTREAM PURGE:
-                // find out which, if any, managed datastreams were purged,
-                // then remove them from low level datastream storage
-                // this was moved because in the case of modifying a datastream
-                // with versioning turned off, if a modification didn't involve
-                // new
-                // content a special url of the form copy:... would be used to
-                // indicate the content for the new datastream version, which
-                // would
-                // point to the content of the most recent version. Which (if
-                // this code
-                // had been executed earlier) would no longer exist in the
-                // low-level store.
+                storeManagedDatastreams(pid, obj, context);
+                
+                /**
+                 * MANAGED DATASTREAM PURGE:
+                 * Find out which, if any, managed datastreams were purged,
+                 * then remove them from low level datastream storage. This
+                 * was moved because in the case of modifying a datastream with
+                 * versioning turned off, if a modification didn't involve new
+                 * content a special url of the form copy:... would be used to
+                 * indicate the content for the new datastream version, which
+                 * would point to the content of the most recent version. Which
+                 * (if this code had been executed earlier) would no longer
+                 * exist in the low-level store.
+                 */
 
                 if (!obj.isNew()) {
                     deletePurgedDatastreams(obj, context);
@@ -1279,38 +1145,21 @@ public class DefaultDOManager extends Module implements DOManager {
                 // MODIFIED DATE:
                 // set digital object last modified date, in UTC
                 obj.setLastModDate(Server.getCurrentDate(context));
-                ByteArrayInputStream serialized;
-
-                // block-scoping the ByteArrayOutputStream to ensure toArray
-                // is only called once
-                // initial capacity is just a guess to prevent copying up from 32 bytes
-                {
-                    ReadableByteArrayOutputStream out = new ReadableByteArrayOutputStream(4096);
-
-                    // FINAL XML SERIALIZATION:
-                    // serialize the object in its final form for persistent storage
-                    logger.debug("Serializing digital object for persistent storage {}",
-                            pid);
-                    m_translator.serialize(obj, out, m_defaultStorageFormat,
-                            m_storageCharacterEncoding,
-                            DOTranslationUtility.SERIALIZE_STORAGE_INTERNAL);
-
-                    
-                    serialized = out.toInputStream();
-                }
+                
+                
+                // FINAL XML SERIALIZATION:
+                // serialize the object in its final form for persistent storage
+                ByteArrayInputStream serialized =
+                        serializeObject(pid, obj);
 
                 // FINAL VALIDATION:
                 // As of version 2.0, final validation is only performed in
-                // DEBUG mode.
-                // This is to help performance during the ingest process since
-                // validation
-                // is a large amount of the overhead of ingest. Instead of a
-                // second run
-                // of the validation module, we depend on the integrity of our
-                // code to
-                // create valid XML files for persistent storage of digital
-                // objects. As
-                // a sanity check, we check that we can deserialize the object
+                // DEBUG mode. This is to help performance during the ingest
+                // process since validation is a large amount of the overhead
+                // of ingest. Instead of a second run of the validation module,
+                // we depend on the integrity of our code to create valid XML
+                // files for persistent storage of digital objects. As a
+                // sanity check, we check that we can deserialize the object
                 // we just serialized
                 if (logger.isDebugEnabled()) {
                     logger.debug("Final Validation (storage phase)");
@@ -1328,20 +1177,7 @@ public class DefaultDOManager extends Module implements DOManager {
                 serialized.reset();
 
                 // RESOURCE INDEX:
-                if (m_resourceIndex != null &&
-                        m_resourceIndex.getIndexLevel() != ResourceIndex.INDEX_LEVEL_OFF) {
-                    logger.info("Adding to ResourceIndex");
-                    if (obj.isNew()) {
-                        m_resourceIndex.addObject(new SimpleDOReader(null,
-                                null, null, null, null, obj));
-                    } else {
-                        m_resourceIndex.modifyObject(getReader(false, null, obj
-                                .getPid()), new SimpleDOReader(null, null,
-                                null, null, null, obj));
-
-                    }
-                    logger.debug("Finished adding {} to ResourceIndex.", pid);
-                }
+                updateResourceIndex(pid, obj);
 
                 // STORAGE:
                 // write XML serialization of object to persistent storage
@@ -1370,77 +1206,23 @@ public class DefaultDOManager extends Module implements DOManager {
                  * update systemVersion in doRegistry (add one), and update
                  * deployment maps if necessary.
                  */
-                logger.debug("Updating registry for {}", pid);
-                Connection conn = null;
-                PreparedStatement s = null;
-                ResultSet results = null;
-                try {
-                    conn = m_connectionPool.getReadWriteConnection();
-                    s = conn.prepareStatement(PID_VERSION_QUERY);
-                    s.setString(1, obj.getPid());
-                    results = s.executeQuery();
-                    if (!results.next()) {
-                        throw new ObjectNotFoundException(
-                                "Error creating replication job: The requested object " +
-                                        pid + " doesn't exist in the registry.");
-                    }
-                    int systemVersion = results.getInt("systemVersion");
-                    systemVersion++;
-                    s = conn.prepareStatement(PID_VERSION_UPDATE);
-                    s.setInt(1, systemVersion);
-                    s.setString(2, obj.getPid());
-                    s.executeUpdate();
-
-                    //TODO hasModel
-                    if (obj.hasContentModel(Models.SERVICE_DEPLOYMENT_3_0)) {
-                        updateDeploymentMap(obj, conn, false);
-                    }
-                } catch (SQLException sqle) {
-                    throw new StorageDeviceException(
-                            "Error creating replication job for " + pid + ": " +
-                                    sqle.getMessage(), sqle);
-                } finally {
-                    try {
-                        if (results != null) {
-                            results.close();
-                        }
-                        if (s != null) {
-                            s.close();
-                        }
-                        if (conn != null) {
-                            m_connectionPool.free(conn);
-                        }
-                    } catch (SQLException sqle) {
-                        throw new StorageDeviceException(
-                                "Unexpected error from SQL database for " +
-                                        pid + ": " + sqle.getMessage(), sqle);
-                    } finally {
-                        results = null;
-                        s = null;
-                    }
-                }
-
-                // REPLICATE:
-                // add to replication jobs table and do replication to db
+                updateDORegistry(obj);
+                
+                // FIELD SEARCH INDEX:
                 logger.info("Updating dissemination index for {}", pid);
-                String whichIndex = "FieldSearch";
 
                 try {
                     logger.info("Updating FieldSearch index");
                     m_fieldSearch.update(new SimpleDOReader(null, null, null,
                             null, null, obj));
 
-                    // FIXME: also remove from temp storage if this is
-                    // successful
-                    //                    removeReplicationJob(obj.getPid());
                 } catch (ServerException se) {
-                    logger.error("Error updating " + whichIndex +
-                            " index for " + pid, se);
+                    logger.error(FIELD_SEARCH_INDEX_ERROR.concat(pid),
+                            se);
                     throw se;
                 } catch (Throwable th) {
                     String msg =
-                            "Error updating " + whichIndex + " index for " +
-                                    pid;
+                            FIELD_SEARCH_INDEX_ERROR.concat(pid);
                     logger.error(msg, th);
                     throw new GeneralException(msg, th);
                 }
@@ -1465,8 +1247,25 @@ public class DefaultDOManager extends Module implements DOManager {
             }
         }
     }
+    
+    private ByteArrayInputStream serializeObject(String pid, DigitalObject obj)
+            throws ObjectIntegrityException, StreamIOException,
+            UnsupportedTranslationException, ServerException {
 
-    /*
+        // initial capacity is just a guess to prevent copying up from 32 bytes
+        ReadableByteArrayOutputStream out = new ReadableByteArrayOutputStream(4096);
+
+        logger.debug("Serializing digital object for persistent storage {}",
+                pid);
+        m_translator.serialize(obj, out, m_defaultStorageFormat,
+                m_storageCharacterEncoding,
+                DOTranslationUtility.SERIALIZE_STORAGE_INTERNAL);
+        
+        return out.toInputStream();
+
+    }
+
+    /**
      * Remove the object from permanent storage. Currently this is used both for
      * ingest failures
      * and for purging an object. failSafe indicates failure in removal of an
@@ -1514,32 +1313,32 @@ public class DefaultDOManager extends Module implements DOManager {
         Iterator<String> dsIDIter = obj.datastreamIdIterator();
         while (dsIDIter.hasNext()) {
             String dsID = dsIDIter.next();
-            String controlGroupType =
-                    obj.datastreams(dsID).iterator().next().DSControlGrp;
-            if (controlGroupType.equalsIgnoreCase("M")) {
-                // iterate over all versions of this dsID
-                for (Datastream dmc : obj.datastreams(dsID)) {
-                    String id =
-                            obj.getPid() + "+" + dmc.DatastreamID + "+" +
-                                    dmc.DSVersionID;
-                    logger.info("Deleting managed datastream: {} for {}",
-                            id, pid);
-                    try {
-                        m_permanentStore.removeDatastream(id);
-                    } catch (LowlevelStorageException llse) {
-                        if (failSafe) {
-                            logger.warn(
-                                    "Error attempting removal of managed " +
-                                            "content datastream " + id +
-                                            " for " + pid +
-                                            " (but that might be ok during a clean-up): ",
-                                    llse);
-                        } else {
-                            logger.error(
-                                    "Error attempting removal of managed " +
-                                            "content datastream " + id +
-                                            " for " + pid + ": ", llse);
-                        }
+            String baseId = obj.getPid() + "+" + dsID + "+";
+            Iterable<Datastream> versions = obj.datastreams(dsID);
+            // iterate over all versions of this dsID
+            dsVersions:
+            for (Datastream dmc : versions) {
+                if (!dmc.DSControlGrp.equalsIgnoreCase("M")) {
+                    break dsVersions;
+                }
+                String id = baseId.concat(dmc.DSVersionID);
+                logger.info("Deleting managed datastream: {} for {}",
+                        id, pid);
+                try {
+                    m_permanentStore.removeDatastream(id);
+                } catch (LowlevelStorageException llse) {
+                    if (failSafe) {
+                        logger.warn(
+                                "Error attempting removal of managed " +
+                                        "content datastream " + id +
+                                        " for " + pid +
+                                        " (but that might be ok during a clean-up): ",
+                                        llse);
+                    } else {
+                        logger.error(
+                                "Error attempting removal of managed " +
+                                        "content datastream " + id +
+                                        " for " + pid + ": ", llse);
                     }
                 }
             }
@@ -1599,6 +1398,124 @@ public class DefaultDOManager extends Module implements DOManager {
             }
         }
 
+    }
+    
+    private void storeManagedDatastreams(
+            String pid, DigitalObject obj,
+            Context context) throws ServerException {
+        Iterator<String> dsIDIter = obj.datastreamIdIterator();
+        while (dsIDIter.hasNext()) {
+            String dsID = dsIDIter.next();
+            Iterable<Datastream> versions = obj.datastreams(dsID);
+            String internalIdBase = pid + "+" + dsID + "+";
+            // if it's managed, we might need to grab content
+            // iterate over all versions of this dsID
+            dsVersions:
+            for (Datastream dmc : versions) {
+                if (!dmc.DSControlGrp.equalsIgnoreCase("M")) {
+                    break dsVersions;
+                }
+                String internalId =
+                        internalIdBase.concat(dmc.DSVersionID);
+                // if it's a url, we need to grab content for this version
+                if (URL_PROTOCOL.matcher(dmc.DSLocation).matches()) {
+                    MIMETypedStream mimeTypedStream;
+                    if (dmc.DSLocation
+                            .startsWith(DatastreamManagedContent.UPLOADED_SCHEME)) {
+                        mimeTypedStream =
+                                getUploadedContent(m_management, pid, dmc);
+                    } else if (dmc.DSLocation
+                            .startsWith(DatastreamManagedContent.COPY_SCHEME)) {
+                        // make a copy of the pre-existing content
+                        mimeTypedStream =
+                                getCopiedContent(m_permanentStore, pid, dmc);
+                    } else if (dmc.DSLocation
+                            .startsWith(DatastreamManagedContent.TEMP_SCHEME)) {
+                        mimeTypedStream = getTempContent(pid, dmc);
+                    } else {
+                        mimeTypedStream =
+                                getExternalContent(pid, m_contentManager, dmc, context);
+                    }
+                    Map<String, String> dsHints =
+                            m_hintProvider
+                            .getHintsForAboutToBeStoredDatastream(
+                                    obj, dmc.DatastreamID);
+
+                    try {
+                        dmc.DSSize =
+                                m_permanentStore.addDatastream(
+                                        internalId,
+                                        mimeTypedStream
+                                        .getStream(),
+                                        dsHints);
+                    } catch (ObjectAlreadyInLowlevelStorageException oailse) {
+                        // object already existed...so we may need to call
+                        // replace if "add" indicates that it exists
+                        if (obj.isNew()) {
+                            throw new GeneralException(
+                                    oailse.getMessage(), oailse);
+                        }
+                        dmc.DSSize =
+                                m_permanentStore
+                                .replaceDatastream(
+                                        internalId,
+                                        mimeTypedStream
+                                        .getStream(),
+                                        dsHints);
+                    }
+
+                    mimeTypedStream.close();
+                    if (dmc.DSLocation
+                            .startsWith(DatastreamManagedContent.TEMP_SCHEME)) {
+                        // delete the temp file created to store
+                        // the binary content from archive
+                        File file =
+                                new File(dmc.DSLocation
+                                        .substring(7));
+                        if (file.exists()) {
+                            if (!file.delete()) {
+                                logger.warn("Failed to remove temp file, marked for deletion when VM closes: " +
+                                        file.toString());
+                                file.deleteOnExit();
+                            }
+                        } else {
+                            logger.warn("Cannot delete temp file as it no longer exists: " +
+                                    file.getAbsolutePath());
+                        }
+                    }
+                    // Reset dsLocation in object to new
+                    // internal location.
+                    dmc.DSLocation = internalId;
+                    dmc.DSLocationType =
+                            Datastream.DS_LOCATION_TYPE_INTERNAL;
+                    logger.info("Replaced managed datastream location with internal id: {}",
+                            internalId);
+                } else if (!internalId.equals(dmc.DSLocation)) {
+                    logger.error("Unrecognized DSLocation \"" +
+                            dmc.DSLocation +
+                            "\" given for datastream " +
+                            dmc.DatastreamID + " of object " + pid);
+                }
+            }
+        }
+    }
+    
+    private void updateResourceIndex(String pid, DigitalObject obj)
+    throws ServerException {
+        if (m_resourceIndex != null &&
+                m_resourceIndex.getIndexLevel() != ResourceIndex.INDEX_LEVEL_OFF) {
+            logger.info("Adding to ResourceIndex");
+            if (obj.isNew()) {
+                m_resourceIndex.addObject(new SimpleDOReader(null,
+                        null, null, null, null, obj));
+            } else {
+                m_resourceIndex.modifyObject(getReader(false, null, obj
+                        .getPid()), new SimpleDOReader(null, null,
+                        null, null, null, obj));
+
+            }
+            logger.debug("Finished adding {} to ResourceIndex.", pid);
+        }
     }
 
     private Set<Long> getDatastreamDates(Iterable<Datastream> ds) {
@@ -1793,126 +1710,13 @@ public class DefaultDOManager extends Module implements DOManager {
     @Override
     public String[] listObjectPIDs(Context context)
             throws StorageDeviceException {
-        return getPIDs("WHERE systemVersion > 0");
-    }
-
-    // translates simple wildcard string to sql-appropriate.
-    // the first character is a " " if it needs an escape
-    public static String toSql(String name, String in) {
-        if (in.indexOf('\\') != -1) {
-            // has one or more escapes, un-escape and translate
-            StringBuffer out = new StringBuffer();
-            out.append('\'');
-            boolean needLike = false;
-            boolean needEscape = false;
-            boolean lastWasEscape = false;
-            for (int i = 0; i < in.length(); i++) {
-                char c = in.charAt(i);
-                if (!lastWasEscape && c == '\\') {
-                    lastWasEscape = true;
-                } else {
-                    char nextChar = '!';
-                    boolean useNextChar = false;
-                    if (!lastWasEscape) {
-                        if (c == '?') {
-                            out.append('_');
-                            needLike = true;
-                        } else if (c == '*') {
-                            out.append('%');
-                            needLike = true;
-                        } else {
-                            nextChar = c;
-                            useNextChar = true;
-                        }
-                    } else {
-                        nextChar = c;
-                        useNextChar = true;
-                    }
-                    if (useNextChar) {
-                        if (nextChar == '\"') {
-                            out.append("\\\"");
-                            needEscape = true;
-                        } else if (nextChar == '\'') {
-                            out.append("\\\'");
-                            needEscape = true;
-                        } else if (nextChar == '%') {
-                            out.append("\\%");
-                            needEscape = true;
-                        } else if (nextChar == '_') {
-                            out.append("\\_");
-                            needEscape = true;
-                        } else {
-                            out.append(nextChar);
-                        }
-                    }
-                    lastWasEscape = false;
-                }
-            }
-            out.append('\'');
-            if (needLike) {
-                out.insert(0, " LIKE ");
-            } else {
-                out.insert(0, " = ");
-            }
-            out.insert(0, name);
-            if (needEscape) {
-                out.insert(0, ' ');
-            }
-            return out.toString();
-        } else {
-            // no escapes, just translate if needed
-            StringBuffer out = new StringBuffer();
-            out.append('\'');
-            boolean needLike = false;
-            boolean needEscape = false;
-            for (int i = 0; i < in.length(); i++) {
-                char c = in.charAt(i);
-                if (c == '?') {
-                    out.append('_');
-                    needLike = true;
-                } else if (c == '*') {
-                    out.append('%');
-                    needLike = true;
-                } else if (c == '\"') {
-                    out.append("\\\"");
-                    needEscape = true;
-                } else if (c == '\'') {
-                    out.append("\\\'");
-                    needEscape = true;
-                } else if (c == '%') {
-                    out.append("\\%");
-                    needEscape = true;
-                } else if (c == '_') {
-                    out.append("\\_");
-                    needEscape = true;
-                } else {
-                    out.append(c);
-                }
-            }
-            out.append('\'');
-            if (needLike) {
-                out.insert(0, " LIKE ");
-            } else {
-                out.insert(0, " = ");
-            }
-            out.insert(0, name);
-            if (needEscape) {
-                out.insert(0, ' ');
-            }
-            return out.toString();
-        }
-    }
-
-    /** whereClause is a WHERE clause, starting with "where" */
-    private String[] getPIDs(String whereClause) throws StorageDeviceException {
         Connection conn = null;
         PreparedStatement s = null;
         ResultSet results = null;
         try {
             conn = m_connectionPool.getReadOnlyConnection();
-            String query = "SELECT doPID FROM doRegistry " + whereClause;
-            s = conn.prepareStatement(query);
-            logger.debug("Executing db query: {}", query);
+            s = conn.prepareStatement(OBJECT_PIDS_QUERY);
+            logger.debug("Executing db query: {}", OBJECT_PIDS_QUERY);
             results = s.executeQuery();
             if (results.next()){
                 ArrayList<String> pidList = new ArrayList<String>();
@@ -1948,6 +1752,18 @@ public class DefaultDOManager extends Module implements DOManager {
                 s = null;
             }
         }
+    }
+
+    /**
+     * Deprecated - this logic was moved into FieldSearchResultSql
+     * @param name
+     * @param in
+     * @return
+     */
+    @Deprecated
+    public static String toSql(String name, String in) {
+        throw new UnsupportedOperationException(
+                "SQL escaping logic moved to FieldSearchResultSQLImpl");
     }
 
     @Override
@@ -2051,14 +1867,12 @@ public class DefaultDOManager extends Module implements DOManager {
      * to the given value. If n is less than one, return the total number of
      * objects in the registry.
      */
-    private int getNumObjectsWithVersion(Connection conn, int n)
+    private static int getNumObjectsWithVersion(Connection conn, int n)
             throws SQLException {
 
         PreparedStatement st = null;
         try {
             String query;
-            // Because we are dealing with only two Strings, one of which is fixed,
-            // take advantage of String.concat
             if (n > 0) {
                 query = "SELECT COUNT(*) FROM doRegistry WHERE systemVersion = ".concat(Integer.toString(n));
             } else {
@@ -2075,7 +1889,7 @@ public class DefaultDOManager extends Module implements DOManager {
         }
     }
 
-    private long getLatestModificationDate(Connection conn) throws SQLException {
+    private static long getLatestModificationDate(Connection conn) throws SQLException {
         PreparedStatement st = null;
         try {
             st = conn.prepareStatement("SELECT MAX(mDate) FROM doFields ");
@@ -2089,123 +1903,6 @@ public class DefaultDOManager extends Module implements DOManager {
             if (st != null) {
                 st.close();
             }
-        }
-    }
-
-    private class ModelDeploymentMap {
-
-        private final Map<ServiceContext, Map<String, Long>> map =
-                new ConcurrentHashMap<ServiceContext, Map<String, Long>>();
-
-        public String putDeployment(ServiceContext cxt, String sDep,
-                long lastModDate) {
-
-            if (!map.containsKey(cxt)) {
-                map.put(cxt, new HashMap<String, Long>());
-            }
-
-            map.get(cxt).put(sDep, lastModDate);
-
-            return getDeployment(cxt);
-
-        }
-
-        /** Removes a deployment from a particular (cModel, sDef) context */
-        public String removeDeployment(ServiceContext cxt, String sDep) {
-
-            Map<String, Long> deployments = map.get(cxt);
-
-            if (deployments != null) {
-                deployments.remove(sDep);
-            }
-
-            return getDeployment(cxt);
-        }
-
-        /** Return the OLDEST deployment for a given (cModel, sDef) context */
-        public String getDeployment(ServiceContext cxt) {
-
-            if (map.containsKey(cxt)) {
-                String sDep = null;
-                int count = 0;
-                long first = -1;
-                for (Map.Entry<String, Long> dep : map.get(cxt).entrySet()) {
-                    if (dep.getValue() < first || first < 0) {
-                        first = dep.getValue();
-                        sDep = dep.getKey();
-                        count++;
-                    }
-                }
-
-                if (count > 1) {
-                    logger.info("More than one service deployment specified for sDef {}" +
-                            " in model " +
-                            "{}.  Using the one with the EARLIEST modification date.",
-                            cxt.sDef, cxt.cModel);
-                }
-                return sDep;
-            } else {
-                return null;
-            }
-        }
-
-        /**
-         * Return all the (cModel, sDef) contexts a serviceDeployment deploys
-         * for
-         */
-        public Set<ServiceContext> getContextFor(String sDep) {
-            Set<ServiceContext> cxt = new HashSet<ServiceContext>();
-
-            for (Entry<ServiceContext, Map<String, Long>> dep : map.entrySet()) {
-                if (dep.getValue().keySet().contains(sDep)) {
-                    cxt.add(dep.getKey());
-                }
-            }
-            return cxt;
-        }
-    }
-
-    private static class ServiceContext {
-
-        public final String cModel;
-
-        public final String sDef;
-
-        private static final String VAL_TEMPLATE = "(%1$s,%2$s)";
-        /* Internal string value for calculating hash code, equality */
-        private final String _val;
-
-        private ServiceContext(String cModelPid, String sDefPid) {
-            cModel = cModelPid;
-            sDef = sDefPid;
-
-            _val = String.format(VAL_TEMPLATE, cModelPid, sDefPid);
-        }
-
-        public static ServiceContext getInstance(String cModel, String sDef) {
-            return new ServiceContext(cModel, sDef);
-        }
-
-        @Override
-        public String toString() {
-            return _val;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (o == null) {
-                return false;
-            }
-
-            if (!(o instanceof ServiceContext)) {
-                return false;
-            }
-            return _val.equals(((ServiceContext) o)._val);
-        }
-
-        @Override
-        public int hashCode() {
-            return _val.hashCode();
         }
     }
 }

@@ -551,7 +551,7 @@ public class FieldSearchResultSQLImpl
     public Date getExpirationDate() {
         return m_expirationDate;
     }
-
+    
     /**
      * Return a condition suitable for a SQL WHERE clause, given a column name
      * and a string with a possible pattern (using * and questionmark
@@ -569,7 +569,7 @@ public class FieldSearchResultSQLImpl
      * @return String a suitable string for use in a SQL WHERE clause, as
      *         described above
      */
-    private static String toSql(String name, String in) {
+    public static String toSql(String name, String in) {
         if (!name.endsWith("pid")) {
             in = in.toLowerCase(); // if it's not a PID-type field,
         }
