@@ -74,6 +74,8 @@ public class MsSQLDDLConverter
                     end.append(",\n");
                 }
                 end.append(" CONSTRAINT ");
+                end.append(spec.getName());
+                end.append("_");
                 end.append(cs.getName());
                 end.append("_unique UNIQUE NONCLUSTERED (");
                 end.append(cs.getName());
@@ -88,6 +90,8 @@ public class MsSQLDDLConverter
                     end.append(",\n");
                 }
                 end.append(" CONSTRAINT ");
+                end.append(spec.getName());
+                end.append("_");
                 end.append(cs.getName());
                 end.append("_fk FOREIGN KEY (");
                 end.append(cs.getName());

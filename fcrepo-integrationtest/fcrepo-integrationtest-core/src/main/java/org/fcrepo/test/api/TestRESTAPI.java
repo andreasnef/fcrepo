@@ -1918,7 +1918,7 @@ public class TestRESTAPI
         EntityUtils.consumeQuietly(response.getEntity());
         get.releaseConnection();
         assertEquals(SC_OK, status);
-        assertEquals("19498", cLen);
+        assertEquals("19918", cLen);
     }
 
     private MultipartEntity _doUploadPost() throws Exception {
