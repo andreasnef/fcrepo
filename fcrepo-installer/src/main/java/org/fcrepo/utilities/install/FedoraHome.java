@@ -161,6 +161,8 @@ public class FedoraHome {
 		} else if (database.equals(InstallOptions.POSTGRESQL)) {
 			dbPoolName = "localPostgreSQLPool";
 			System.out.println("\tConfiguring for PostgreSQL 9.1 defaults; see documentation for Postgres < 9.1");
+		} else if (database.equals(InstallOptions.MSSQL)) {
+			dbPoolName = "localMSSQLPool";
 		} else {
 			throw new InstallationFailedException(
 					"unable to configure for unknown database: " + database);
