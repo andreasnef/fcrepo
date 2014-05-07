@@ -107,6 +107,8 @@ public class InstallOptions {
 
     public static final String POSTGRESQL = "postgresql";
 
+    public static final String MSSQL = "mssql";
+
     public static final String OTHER = "other";
 
     public static final String EXISTING_TOMCAT = "existingTomcat";

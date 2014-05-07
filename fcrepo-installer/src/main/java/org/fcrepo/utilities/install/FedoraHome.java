@@ -157,6 +157,8 @@ public class FedoraHome {
 			backslashIsEscape = "false";
 		} else if (database.equals(InstallOptions.POSTGRESQL)) {
 			dbPoolName = "localPostgreSQLPool";
+		} else if (database.equals(InstallOptions.MSSQL)) {
+			dbPoolName = "localMSSQLPool";
 		} else {
 			throw new InstallationFailedException(
 					"unable to configure for unknown database: " + database);
