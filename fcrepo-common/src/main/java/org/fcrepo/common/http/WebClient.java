@@ -182,11 +182,31 @@ public class WebClient {
             boolean failIfNotOK,
             String user,
             String pass) throws IOException {
+        return head(url, failIfNotOK, user, pass, null, null, null);
+    }
+
+    public HttpInputStream head(String url,
+            boolean failIfNotOK,
+            String user,
+            String pass,
+            String ifNoneMatch,
+            String ifModifiedSince,
+            String range) throws IOException {
         UsernamePasswordCredentials creds = null;
         if (user != null && !user.isEmpty() && pass != null && !pass.isEmpty())
             creds = new UsernamePasswordCredentials(user, pass);
-        return head(url, failIfNotOK, creds);
-    }
+        return head(url, failIfNotOK, creds, ifNoneMatch, ifModifiedSince, range);
+     }
+
+    public HttpInputStream head(String url,
+            boolean failIfNotOK,
+            UsernamePasswordCredentials creds,
+            String ifNoneMatch,
+            String ifModifiedSince,
+            String range) throws IOException {
+        return execute(new HttpHead(url), url, failIfNotOK, creds, ifNoneMatch, ifModifiedSince, range);
+     }
+
     /**
      * Get an HTTP resource with the response as an InputStream, given a URL. If
      * FOLLOW_REDIRECTS is true, up to MAX_REDIRECTS redirects will be followed.
@@ -209,7 +229,7 @@ public class WebClient {
                                boolean failIfNotOK,
                                UsernamePasswordCredentials creds)
             throws IOException {
-        return execute(new HttpGet(url), url, failIfNotOK, creds, null, null, null);
+        return get(url, failIfNotOK, creds, null, null, null);
     }
 
     public HttpInputStream get(String url,
@@ -226,7 +246,7 @@ public class WebClient {
                      boolean failIfNotOK,
                      UsernamePasswordCredentials creds)
             throws IOException {
-        return execute(new HttpHead(url), url, failIfNotOK, creds, null, null, null);
+        return head(url, failIfNotOK, creds, null, null, null);
     }
 
     private HttpInputStream execute(HttpUriRequest request,
@@ -250,7 +270,10 @@ public class WebClient {
         HttpInputStream in = new HttpInputStream(client, request);
         int status = in.getStatusCode();
         if (failIfNotOK) {
-            if (status != HttpStatus.SC_OK && status != HttpStatus.SC_NOT_MODIFIED) {
+            if (status != HttpStatus.SC_OK && 
+                status != HttpStatus.SC_NOT_MODIFIED &&
+                status != HttpStatus.SC_PARTIAL_CONTENT &&
+                status != HttpStatus.SC_REQUESTED_RANGE_NOT_SATISFIABLE) {
                 //if (followRedirects && in.getStatusCode() == 302){
                 if (wconfig.getFollowRedirects() && 300 <= status && status <= 399) {
                     int count = 1;

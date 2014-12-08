@@ -6,7 +6,6 @@ package org.fcrepo.server.storage;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URI;
 import java.net.URL;
 import java.util.Date;
@@ -30,6 +29,7 @@ import org.fcrepo.server.utilities.MD5Utility;
 import org.fcrepo.server.errors.GeneralException;
 import org.fcrepo.server.errors.HttpServiceNotFoundException;
 import org.fcrepo.server.errors.ModuleInitializationException;
+import org.fcrepo.server.errors.RangeNotSatisfiableException;
 import org.fcrepo.server.errors.authorization.AuthzException;
 import org.fcrepo.server.security.Authorization;
 import org.fcrepo.server.security.BackendPolicies;
@@ -151,7 +151,7 @@ public class DefaultExternalContentManager
      */
     @Override
     public MIMETypedStream getExternalContent(ContentManagerParams params)
-            throws GeneralException, HttpServiceNotFoundException{
+            throws GeneralException, HttpServiceNotFoundException, RangeNotSatisfiableException {
         logger.debug("in getExternalContent(), url={}", params.getUrl());
         try {
             if(params.getProtocol().equals("file")){
@@ -161,6 +161,9 @@ public class DefaultExternalContentManager
                 return getFromWeb(params);
             }
             throw new GeneralException("protocol for retrieval of external content not supported. URL: " + params.getUrl());
+        }
+        catch (RangeNotSatisfiableException re) {
+        	throw re;
         } catch (Exception ex) {
             // catch anything but generalexception
             ex.printStackTrace();
@@ -179,13 +182,16 @@ public class DefaultExternalContentManager
      */
     private MIMETypedStream getFromWeb(String url, String user, String pass,
             String knownMimeType, boolean headOnly, Context context)
-            throws GeneralException {
-        logger.debug("DefaultExternalContentManager.get({})", url);
+            throws GeneralException, RangeNotSatisfiableException {
+        logger.debug("DefaultExternalContentManager.getFromWeb({})", url);
         if (url == null) throw new GeneralException("null url");
         HttpInputStream response = null;
         try {
             if (headOnly) {
-                response = m_http.head(url, true, user, pass);
+                response = m_http.head(url, true, user, pass,
+                        context.getHeaderValue(HttpHeaders.IF_NONE_MATCH),
+                        context.getHeaderValue(HttpHeaders.IF_MODIFIED_SINCE),
+                        context.getHeaderValue("Range"));
             } else {
                 response = m_http.get(
                         url, true, user, pass,
@@ -202,28 +208,40 @@ public class DefaultExternalContentManager
             if (mimeType == null || mimeType.isEmpty()) {
                 mimeType = DEFAULT_MIMETYPE;
             }
-            if (headOnly) {
-                try {
-                    response.close();
-                } catch (IOException ioe) {
-                    logger.warn("problem closing HEAD response: {}", ioe.getMessage());
+            if (response.getStatusCode() == HttpStatus.SC_NOT_MODIFIED) {
+                response.close();
+                Header[] respHeaders = response.getResponseHeaders();
+                Property[] properties = new Property[respHeaders.length];
+                for (int i = 0; i < respHeaders.length; i++){
+                    properties[i] =
+                        new Property(respHeaders[i].getName(), respHeaders[i].getValue());
                 }
-                return new MIMETypedStream(mimeType, NullInputStream.NULL_STREAM,
+                return MIMETypedStream.getNotModified(properties);
+            } else if (response.getStatusCode() == HttpStatus.SC_PARTIAL_CONTENT) {
+            	MIMETypedStream pc_response = new MIMETypedStream(mimeType, response,
                         headerArray, length);
+            	pc_response.setStatusCode(HttpStatus.SC_PARTIAL_CONTENT);
+            	return pc_response;
+            } else if (response.getStatusCode() == HttpStatus.SC_REQUESTED_RANGE_NOT_SATISFIABLE) {
+            	response.close();
+            	throw new RangeNotSatisfiableException("External URL datastream request returned 416 Range Not Satisfiable");
             } else {
-                if (response.getStatusCode() == HttpStatus.SC_NOT_MODIFIED) {
-                    response.close();
-                    Header[] respHeaders = response.getResponseHeaders();
-                    Property[] properties = new Property[respHeaders.length];
-                    for (int i = 0; i < respHeaders.length; i++){
-                        properties[i] =
-                            new Property(respHeaders[i].getName(), respHeaders[i].getValue());
+                if (headOnly) {
+                    try {
+                        response.close();
+                    } catch (IOException ioe) {
+                        logger.warn("problem closing HEAD response: {}", ioe.getMessage());
                     }
-                    return MIMETypedStream.getNotModified(properties);
+                    
+                    return new MIMETypedStream(mimeType, NullInputStream.NULL_STREAM,
+                            headerArray, length);
                 } else {
                     return new MIMETypedStream(mimeType, response, headerArray, length);
                 }
             }
+        } catch (RangeNotSatisfiableException re){
+        	logger.error(re.getMessage(), re);
+        	throw re;                    
         } catch (Exception e) {
             throw new GeneralException("Error getting " + url, e);
         }
@@ -252,9 +270,10 @@ public class DefaultExternalContentManager
      * @return
      * @throws HttpServiceNotFoundException
      * @throws GeneralException
+     * @throws RangeNotSatisfiableException
      */
     private MIMETypedStream getFromFilesystem(ContentManagerParams params)
-            throws HttpServiceNotFoundException,GeneralException {
+            throws HttpServiceNotFoundException,RangeNotSatisfiableException,GeneralException {
         logger.debug("in getFromFilesystem(), url={}", params.getUrl());
 
         try {
@@ -279,21 +298,22 @@ public class DefaultExternalContentManager
                 mimeType = determineMimeType(cFile);
             }
             Property [] headers = getFileDatastreamHeaders(cUriString, cFile.lastModified());
-            if (isHEADRequest(params)) {
-                return new MIMETypedStream(mimeType, NullInputStream.NULL_STREAM,
-                        headers,
-                        cFile.length());
-            } else if (ServerUtility.isStaleCache(params.getContext(), headers)) {
+            if (ServerUtility.isStaleCache(params.getContext(), headers)) {
+                MIMETypedStream result;
+                if (isHEADRequest(params)) {
+                    result = new MIMETypedStream(mimeType, NullInputStream.NULL_STREAM,
+                            headers, cFile.length());
+                } else {
+                    result = new MIMETypedStream(mimeType, fileUrl.openStream(),
+                            headers, cFile.length());
+                }
                 String rangeHdr =
-                    params.getContext().getHeaderValue(HttpHeaders.RANGE);
-                InputStream content = fileUrl.openStream();
-                long cLen = cFile.length();
-                MIMETypedStream result = new MIMETypedStream(mimeType, content, headers, cLen);
+                        params.getContext().getHeaderValue(HttpHeaders.RANGE);
                 if (rangeHdr != null) {
                     result.setRange(rangeHdr);;
-                } else {
                 }
                 return result;
+                
             } else {
                 return MIMETypedStream.getNotModified(headers);
             }
@@ -301,6 +321,10 @@ public class DefaultExternalContentManager
         catch(AuthzException ae){
             logger.error(ae.getMessage(),ae);
             throw new HttpServiceNotFoundException("Policy blocked datastream resolution",ae);
+        }
+        catch (RangeNotSatisfiableException re){
+        	logger.error(re.getMessage(), re);
+        	throw re;
         }
         catch (GeneralException me) {
             logger.error(me.getMessage(),me);
@@ -324,9 +348,10 @@ public class DefaultExternalContentManager
      * @return A MIMETypedStream
      * @throws ModuleInitializationException
      * @throws GeneralException
+     * @throws RangeNotSatisfiableException
      */
     private MIMETypedStream getFromWeb(ContentManagerParams params)
-            throws ModuleInitializationException, GeneralException {
+            throws ModuleInitializationException, GeneralException, RangeNotSatisfiableException {
            String username = params.getUsername();
         String password = params.getPassword();
         boolean backendSSL = false;
