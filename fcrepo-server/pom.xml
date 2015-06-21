@@ -355,6 +355,12 @@
     </dependency>
 
     <dependency>
+      <groupId>com.yourmediashelf.fedora.akubra</groupId>
+      <artifactId>uuid-datepath-idmapper</artifactId>
+      <version>0.5</version>
+    </dependency>
+
+    <dependency>
       <groupId>commons-beanutils</groupId>
       <artifactId>commons-beanutils</artifactId>
     </dependency>
